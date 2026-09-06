@@ -15,10 +15,16 @@ on:
         required: false
         type: boolean
         default: true
+      changelog:
+        description: '更新日志 (可选，不填则默认显示版本号)'
+        required: false
+        type: string
+        default: ''
 
 env:
   IS_STABLE: ${{ github.event_name == 'workflow_dispatch' && inputs.is_stable || !contains(github.ref, '-') }}
   APP_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}
+  CHANGELOG: ${{ github.event_name == 'workflow_dispatch' && inputs.changelog || '' }}
   GRADLE_OPTS: -Dorg.gradle.vfs.watch=false
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   SENTRY_BACKEND: none
@@ -89,6 +95,18 @@ jobs:
           flutter pub get
           dart run build_runner build -d
           dart setup.dart android --arch arm64 ${{ env.IS_STABLE == 'true' && '--env stable' || '' }}
+
+      - name: Generate changelog
+        shell: bash
+        run: |
+          mkdir -p ./dist
+          if [ -n "$CHANGELOG" ]; then
+            echo "$CHANGELOG" > ./dist/CHANGELOG.txt
+          elif [ -n "$APP_VERSION" ]; then
+            echo "Bettbox v${APP_VERSION}" > ./dist/CHANGELOG.txt
+          else
+            echo "Bettbox $(date +%Y%m%d)" > ./dist/CHANGELOG.txt
+          fi
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v7
