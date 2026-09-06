@@ -4,9 +4,21 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号 (例如 1.0.0)'
+        required: true
+        type: string
+      is_stable:
+        description: '是否为稳定版'
+        required: false
+        type: boolean
+        default: true
 
 env:
-  IS_STABLE: ${{ !contains(github.ref, '-') }}
+  IS_STABLE: ${{ github.event_name == 'workflow_dispatch' && inputs.is_stable || !contains(github.ref, '-') }}
+  APP_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}
   GRADLE_OPTS: -Dorg.gradle.vfs.watch=false
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   SENTRY_BACKEND: none
@@ -81,7 +93,7 @@ jobs:
       - name: Upload Artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: Bettbox-android-arm64
+          name: Bettbox-android-arm64${{ env.APP_VERSION != '' && format('-v{0}', env.APP_VERSION) || '' }}
           path: ./dist
           compression-level: 9
           overwrite: true
