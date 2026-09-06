@@ -115,14 +115,62 @@ Future<void> _service(List<String> flags) async {
     final clashLibHandler = ClashLibHandler();
     final smartAutoStopLock = Lock();
 
-    Future<void> checkSmartAutoStop() async {
+    // --- Operation cooldown (3s) ---
+    DateTime? _lastSmartOperationTime;
+    const _cooldownDuration = Duration(seconds: 3);
+
+    bool _isInCooldown() {
+      if (_lastSmartOperationTime == null) return false;
+      return DateTime.now().difference(_lastSmartOperationTime!) <
+          _cooldownDuration;
+    }
+
+    // --- Smart-stopped polling (1s x 30) ---
+    Timer? smartStoppedPollTimer;
+
+    void stopSmartStoppedPoll() {
+      smartStoppedPollTimer?.cancel();
+    }
+
+    // Forward declaration
+    late Future<void> Function() checkSmartAutoStop;
+
+    void startSmartStoppedPoll() {
+      smartStoppedPollTimer?.cancel();
+      int pollCount = 0;
+      smartStoppedPollTimer = Timer.periodic(
+        const Duration(seconds: 1),
+        (_) async {
+          pollCount++;
+          if (pollCount > 30) {
+            smartStoppedPollTimer?.cancel();
+            return;
+          }
+          final isSmartStopped = await vpn?.isSmartStopped() ?? false;
+          if (!isSmartStopped) {
+            smartStoppedPollTimer?.cancel();
+            return;
+          }
+          final isRunning = await vpn?.getStatus() ?? false;
+          if (!isRunning) {
+            smartStoppedPollTimer?.cancel();
+            return;
+          }
+          await checkSmartAutoStop();
+        },
+      );
+    }
+
+    Future<void> _doCheckSmartAutoStop() async {
       try {
+        if (_isInCooldown()) return;
         final vpnProps = globalState.config.vpnProps;
         if (!vpnProps.smartAutoStop) return;
         final networks = vpnProps.smartAutoStopNetworks;
         if (networks.isEmpty) return;
 
         await smartAutoStopLock.synchronized(() async {
+          if (_isInCooldown()) return;
           final isSmartStopped = await vpn?.isSmartStopped() ?? false;
           final candidateIps =
               await vpn?.getLocalIpAddresses() ?? const <String>[];
@@ -143,15 +191,31 @@ Future<void> _service(List<String> flags) async {
             if (isRunning) {
               await vpn?.setSmartStopped(true);
               await vpn?.smartStop();
+              _lastSmartOperationTime = DateTime.now();
+              startSmartStoppedPoll();
             }
           } else if (!shouldStop && isSmartStopped) {
             await vpn?.setSmartStopped(false);
             await vpn?.smartResume(clashLibHandler.getAndroidVpnOptions());
+            _lastSmartOperationTime = DateTime.now();
+            stopSmartStoppedPoll();
           }
         });
       } catch (e) {
         commonPrint.log('Smart auto stop check failed: $e');
       }
+    }
+
+    checkSmartAutoStop = _doCheckSmartAutoStop;
+
+    // Debounced - 1.5s delay lets WiFi fully establish
+    int _networkChangeCheckSequence = 0;
+    void _debouncedCheckSmartAutoStop() {
+      final currentSequence = ++_networkChangeCheckSequence;
+      Future.delayed(const Duration(milliseconds: 1500), () async {
+        if (currentSequence != _networkChangeCheckSequence) return;
+        await checkSmartAutoStop();
+      });
     }
 
     tile?.addListener(
@@ -162,6 +226,7 @@ Future<void> _service(List<String> flags) async {
         },
         onStop: () async {
           await app.tip(appLocalizations.stopVpn);
+          stopSmartStoppedPoll();
           clashLibHandler.stopListener();
           await vpn?.stop();
         },
@@ -179,7 +244,7 @@ Future<void> _service(List<String> flags) async {
         onDnsChanged: (String dns) {
           clashLibHandler.updateDns(dns);
         },
-        onNetworkChanged: checkSmartAutoStop,
+        onNetworkChanged: _debouncedCheckSmartAutoStop,
       ),
     );
 
@@ -196,7 +261,9 @@ Future<void> _service(List<String> flags) async {
       return;
     }
 
-    commonPrint.log('Executing ${bootStart ? "boot" : "quick"} start sequence');
+    commonPrint.log(
+      'Executing ${bootStart ? "boot" : "quick"} start sequence',
+    );
     await ClashCore.initGeo();
     app.tip(appLocalizations.startVpn);
     final homeDirPath = await appPath.homeDirPath;
@@ -226,7 +293,21 @@ Future<void> _service(List<String> flags) async {
           return;
         }
         await vpn?.start(clashLibHandler.getAndroidVpnOptions());
-        Future.delayed(const Duration(seconds: 2), checkSmartAutoStop);
+        // Retry every 1s, up to 8 attempts (replaces official 2s single)
+        Future(() async {
+          final vpnProps = globalState.config.vpnProps;
+          if (!vpnProps.smartAutoStop) return;
+          final networks = vpnProps.smartAutoStopNetworks;
+          if (networks.isEmpty) return;
+          for (int attempt = 0; attempt < 8; attempt++) {
+            await Future.delayed(const Duration(seconds: 1));
+            await checkSmartAutoStop();
+            final isSmartStopped = await vpn?.isSmartStopped() ?? false;
+            final isRunning = await vpn?.getStatus() ?? false;
+            if (!isRunning) return;
+            if (isSmartStopped) return;
+          }
+        });
 
         if (globalState.config.vpnProps.networkSpeedNotification) {
           final profile = globalState.config.profiles
@@ -258,7 +339,9 @@ Future<void> _service(List<String> flags) async {
 void _handleMainIpc(ClashLibHandler clashLibHandler) {
   final sendPort = IsolateNameServer.lookupPortByName(mainIsolate);
   if (sendPort == null) {
-    commonPrint.log('Service: mainIsolate sendPort not found, IPC unavailable');
+    commonPrint.log(
+      'Service: mainIsolate sendPort not found, IPC unavailable',
+    );
     return;
   }
 
@@ -273,7 +356,9 @@ void _handleMainIpc(ClashLibHandler clashLibHandler) {
   _safeSend(sendPort, _serviceReceiverPort!.sendPort);
 
   _messageReceiverPort = ReceivePort();
-  clashLibHandler.attachMessagePort(_messageReceiverPort!.sendPort.nativePort);
+  clashLibHandler.attachMessagePort(
+    _messageReceiverPort!.sendPort.nativePort,
+  );
   _messageReceiverPort!.listen((message) {
     _safeSend(sendPort, message);
   });
@@ -305,9 +390,9 @@ class _TileListenerWithService with TileListener {
     required Function() onStart,
     required Function() onStop,
     required Function() onReconnectIpc,
-  }) : _onStart = onStart,
-       _onStop = onStop,
-       _onReconnectIpc = onReconnectIpc;
+  })  : _onStart = onStart,
+        _onStop = onStop,
+        _onReconnectIpc = onReconnectIpc;
 
   @override
   void onStart() => _onStart();
