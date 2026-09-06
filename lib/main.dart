@@ -176,7 +176,19 @@ Future<void> _service(List<String> flags) async {
               await vpn?.getLocalIpAddresses() ?? const <String>[];
           final candidateGateways =
               await vpn?.getLocalGateways() ?? const <String>[];
-          if (candidateIps.isEmpty && candidateGateways.isEmpty) return;
+          if (candidateIps.isEmpty && candidateGateways.isEmpty) {
+            // When IP info is unavailable (network transitioning, Doze wake,
+            // or networks set temporarily empty during WiFi disconnect):
+            // If currently smart-stopped, attempt resume. The Kotlin-side
+            // periodic check will re-stop if network still matches.
+            if (isSmartStopped) {
+              await vpn?.setSmartStopped(false);
+              await vpn?.smartResume(clashLibHandler.getAndroidVpnOptions());
+              _lastSmartOperationTime = DateTime.now();
+              stopSmartStoppedPoll();
+            }
+            return;
+          }
 
           final shouldStop =
               candidateIps.any(
@@ -215,6 +227,11 @@ Future<void> _service(List<String> flags) async {
       Future.delayed(const Duration(milliseconds: 1000), () async {
         if (currentSequence != _networkChangeCheckSequence) return;
         await checkSmartAutoStop();
+        // If still smart-stopped after check, restart polling
+        final isSmartStopped = await vpn?.isSmartStopped() ?? false;
+        if (isSmartStopped) {
+          startSmartStoppedPoll();
+        }
       });
     }
 
@@ -293,7 +310,7 @@ Future<void> _service(List<String> flags) async {
           return;
         }
         await vpn?.start(clashLibHandler.getAndroidVpnOptions());
-        // Retry every 1s, up to 8 attempts (replaces official 2s single)
+        // Retry every 1s, up to 8 attempts
         Future(() async {
           final vpnProps = globalState.config.vpnProps;
           if (!vpnProps.smartAutoStop) return;
