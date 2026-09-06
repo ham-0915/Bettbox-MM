@@ -93,6 +93,16 @@ class Vpn {
     });
   }
 
+  Future<void> syncSmartStopConfig({
+    required bool enabled,
+    required List<String> networks,
+  }) async {
+    await methodChannel.invokeMethod('syncSmartStopConfig', {
+      'enabled': enabled,
+      'networks': networks,
+    });
+  }
+
   Future<bool> getStatus() async {
     return await methodChannel.invokeMethod<bool>('status') ?? false;
   }
