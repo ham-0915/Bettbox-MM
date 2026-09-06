@@ -76,32 +76,58 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     private var lastDns = ""
 
     // --- Screen state broadcast receiver ---
-    // When screen turns on, send networkChanged at 0ms, 500ms, and 2000ms.
-    // Only the last successful delivery triggers actual check via debounce.
-    // This handles:
-    //   - Normal case: 0ms hit succeeds, debounce fires at 1s
-    //   - Flutter waking up: 500ms hit succeeds, debounce fires at 1.5s
-    //   - Aggressive Doze (MIUI): 2000ms hit succeeds, debounce fires at 3s
+    // When screen turns on, send networkChanged at multiple timepoints.
+    // Covers different Flutter engine wake-up scenarios.
     private val screenHandler = Handler(Looper.getMainLooper())
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             when (intent?.action) {
                 Intent.ACTION_SCREEN_ON, Intent.ACTION_USER_PRESENT -> {
-                    // Immediate send
                     invokeDart("networkChanged")
-                    // Retry at 500ms (Flutter engine waking up)
                     screenHandler.postDelayed({
                         invokeDart("networkChanged")
                     }, 500)
-                    // Retry at 2s (fallback for aggressive Doze)
                     screenHandler.postDelayed({
                         invokeDart("networkChanged")
                     }, 2000)
+                    screenHandler.postDelayed({
+                        invokeDart("networkChanged")
+                    }, 5000)
                 }
             }
         }
     }
     private val screenReceiverRegistered = AtomicBoolean(false)
+
+    // --- Smart-stopped periodic check (Kotlin-side) ---
+    // While VPN is in smart-stopped state, send invokeDart("networkChanged")
+    // every 5 seconds. This runs in Kotlin's Handler (foreground service process),
+    // NOT in Flutter's Timer, so it works even when Flutter engine is paused by Doze.
+    // Once Dart wakes up and processes the signal, it will check network state
+    // and resume VPN if WiFi is gone.
+    private var smartStoppedCheckHandler: Handler? = null
+    private var smartStoppedCheckRunnable: Runnable? = null
+
+    private fun startSmartStoppedPeriodicCheck() {
+        stopSmartStoppedPeriodicCheck()
+        smartStoppedCheckHandler = Handler(Looper.getMainLooper())
+        smartStoppedCheckRunnable = object : Runnable {
+            override fun run() {
+                if (!GlobalState.isSmartStopped) return
+                invokeDart("networkChanged")
+                smartStoppedCheckHandler?.postDelayed(this, 5000)
+            }
+        }
+        smartStoppedCheckHandler?.postDelayed(smartStoppedCheckRunnable!!, 5000)
+    }
+
+    private fun stopSmartStoppedPeriodicCheck() {
+        smartStoppedCheckRunnable?.let {
+            smartStoppedCheckHandler?.removeCallbacks(it)
+        }
+        smartStoppedCheckRunnable = null
+        smartStoppedCheckHandler = null
+    }
 
     val networks: MutableSet<Network> = Collections.newSetFromMap(ConcurrentHashMap())
 
@@ -734,14 +760,14 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         }
         uidPageNameMap.getOrPut(nextUid) {
             BettboxApplication.getAppContext().packageManager?.getPackagesForUid(nextUid)
-                ?.firstOrNull() ?: ""
-        }
-    }.getOrElse {
-        android.util.Log.e("VpnPlugin", "resolverProcess error: ${it.message}")
+                ?.first: ${it.message}")
         ""
     }
 
     fun handleStop(force: Boolean = false) {
+        // Stop smart-stopped periodic check
+        stopSmartStoppedPeriodicCheck()
+
         val serviceRef: BaseServiceInterface?
         val wasBound: Boolean
         val shouldForceStop: Boolean
@@ -773,7 +799,10 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         val context = BettboxApplication.getAppContext()
         if (shouldForceStop) {
             context.stopService(Intent(context, BettboxVpnService::class.java))
-            context.stopService(Intent(context, BettboxService::class.java))
+            context.stopService(Intent(contextOrNull() ?: ""
+        }
+    }.getOrElse {
+        android.util.Log.e("VpnPlugin", "resolverProcess error, BettboxService::class.java))
         }
 
         runCatching {
@@ -812,9 +841,15 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             Toast.makeText(BettboxApplication.getAppContext(), "Bettbox Suspended", Toast.LENGTH_SHORT).show()
         }
         ServicePlugin.notifyNetworkChanged()
+
+        // Start Kotlin-side periodic check while smart-stopped
+        startSmartStoppedPeriodicCheck()
     }
 
     fun handleSmartResume(options: VpnOptions): Boolean {
+        // Stop Kotlin-side periodic check
+        stopSmartStoppedPeriodicCheck()
+
         scope.launch {
             val startAllowed = GlobalState.runLock.withLock {
                 if (GlobalState.currentRunState == RunState.START) return@withLock false
