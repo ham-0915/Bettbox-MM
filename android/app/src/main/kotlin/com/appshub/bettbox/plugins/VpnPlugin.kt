@@ -76,16 +76,27 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     private var lastDns = ""
 
     // --- Screen state broadcast receiver ---
-    // When screen turns on, trigger networkChanged to handle Doze-delayed
-    // callbacks (e.g. VPN stuck in smart-stopped after WiFi off during sleep).
+    // When screen turns on, send networkChanged at 0ms, 500ms, and 2000ms.
+    // Only the last successful delivery triggers actual check via debounce.
+    // This handles:
+    //   - Normal case: 0ms hit succeeds, debounce fires at 1s
+    //   - Flutter waking up: 500ms hit succeeds, debounce fires at 1.5s
+    //   - Aggressive Doze (MIUI): 2000ms hit succeeds, debounce fires at 3s
     private val screenHandler = Handler(Looper.getMainLooper())
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             when (intent?.action) {
                 Intent.ACTION_SCREEN_ON, Intent.ACTION_USER_PRESENT -> {
+                    // Immediate send
+                    invokeDart("networkChanged")
+                    // Retry at 500ms (Flutter engine waking up)
                     screenHandler.postDelayed({
                         invokeDart("networkChanged")
-                    }, 1500)
+                    }, 500)
+                    // Retry at 2s (fallback for aggressive Doze)
+                    screenHandler.postDelayed({
+                        invokeDart("networkChanged")
+                    }, 2000)
                 }
             }
         }
