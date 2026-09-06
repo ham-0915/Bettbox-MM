@@ -208,11 +208,11 @@ Future<void> _service(List<String> flags) async {
 
     checkSmartAutoStop = _doCheckSmartAutoStop;
 
-    // Debounced - 1.5s delay lets WiFi fully establish
+    // Debounced - 1s delay lets WiFi fully establish
     int _networkChangeCheckSequence = 0;
     void _debouncedCheckSmartAutoStop() {
       final currentSequence = ++_networkChangeCheckSequence;
-      Future.delayed(const Duration(milliseconds: 1500), () async {
+      Future.delayed(const Duration(milliseconds: 1000), () async {
         if (currentSequence != _networkChangeCheckSequence) return;
         await checkSmartAutoStop();
       });
