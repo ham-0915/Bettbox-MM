@@ -705,7 +705,7 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         }
         if (!canStart) return
 
-        com.appshub.bettbox.core.Core.startTun(
+        Core.startTun(
             fd = fd ?: 0,
             protect = this@VpnPlugin::protect,
             resolverProcess = this@VpnPlugin::resolverProcess,
@@ -760,7 +760,10 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         }
         uidPageNameMap.getOrPut(nextUid) {
             BettboxApplication.getAppContext().packageManager?.getPackagesForUid(nextUid)
-                ?.first: ${it.message}")
+                ?.firstOrNull() ?: ""
+        }
+    }.getOrElse {
+        android.util.Log.e("VpnPlugin", "resolverProcess error: ${it.message}")
         ""
     }
 
@@ -799,10 +802,7 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         val context = BettboxApplication.getAppContext()
         if (shouldForceStop) {
             context.stopService(Intent(context, BettboxVpnService::class.java))
-            context.stopService(Intent(contextOrNull() ?: ""
-        }
-    }.getOrElse {
-        android.util.Log.e("VpnPlugin", "resolverProcess error, BettboxService::class.java))
+            context.stopService(Intent(context, BettboxService::class.java))
         }
 
         runCatching {
