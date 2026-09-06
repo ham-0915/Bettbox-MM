@@ -1,8 +1,10 @@
 package com.appshub.bettbox.plugins
 
+import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.ServiceConnection
 import android.net.ConnectivityManager
 import android.net.LinkProperties
@@ -10,7 +12,9 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.service.quicksettings.TileService
 import android.widget.Toast
 import androidx.core.content.getSystemService
@@ -70,6 +74,23 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     private var quickResponseJob: Job? = null
     private var lastNetworkType: Int? = null
     private var lastDns = ""
+
+    // --- Screen state broadcast receiver ---
+    // When screen turns on, trigger networkChanged to handle Doze-delayed
+    // callbacks (e.g. VPN stuck in smart-stopped after WiFi off during sleep).
+    private val screenHandler = Handler(Looper.getMainLooper())
+    private val screenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                Intent.ACTION_SCREEN_ON, Intent.ACTION_USER_PRESENT -> {
+                    screenHandler.postDelayed({
+                        invokeDart("networkChanged")
+                    }, 1500)
+                }
+            }
+        }
+    }
+    private val screenReceiverRegistered = AtomicBoolean(false)
 
     val networks: MutableSet<Network> = Collections.newSetFromMap(ConcurrentHashMap())
 
@@ -190,6 +211,10 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                 result.success(getLocalIpAddresses())
             }
 
+            "getLocalGateways" -> {
+                result.success(getLocalGateways())
+            }
+
             "setSmartStopped" -> {
                 val value = call.argument<Boolean>("value") ?: false
                 GlobalState.isSmartStopped = value
@@ -209,7 +234,7 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                 val data = call.argument<String>("data")
                 result.success(handleSmartResume(Gson().fromJson(data, VpnOptions::class.java)))
             }
-            
+
             "setQuickResponse" -> {
                 quickResponseEnabled = call.argument<Boolean>("enabled") ?: false
                 result.success(true)
@@ -232,13 +257,28 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             }
         }
     }
-    
+
     fun setQuickResponse(enabled: Boolean) {
         quickResponseEnabled = enabled
     }
 
+    private fun getActivePhysicalNetworks(): Set<Network> {
+        val current = networks
+        if (current.isNotEmpty()) return current
+
+        val cm = connectivity ?: return emptySet()
+        val isPhysical: (Network) -> Boolean = { net ->
+            cm.getNetworkCapabilities(net)?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == false
+        }
+
+        val available = cm.allNetworks.filter(isPhysical).toSet()
+        if (available.isNotEmpty()) return available
+
+        return cm.activeNetwork?.takeIf(isPhysical)?.let { setOf(it) } ?: emptySet()
+    }
+
     fun getLocalIpAddresses(): List<String> = runCatching {
-        networks.flatMap { network ->
+        getActivePhysicalNetworks().flatMap { network ->
             connectivity?.getLinkProperties(network)
                 ?.linkAddresses
                 ?.mapNotNull { it.address }
@@ -252,7 +292,7 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     }
 
     fun getLocalGateways(): List<String> = runCatching {
-        networks.flatMap { network ->
+        getActivePhysicalNetworks().flatMap { network ->
             connectivity?.getLinkProperties(network)
                 ?.routes
                 ?.filter { it.isDefaultRoute() }
@@ -332,6 +372,7 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         override fun onAvailable(network: Network) {
             networks.add(network)
             handleNetworkChange()
+            invokeDart("networkChanged")
         }
 
         override fun onLost(network: Network) {
@@ -339,6 +380,7 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             networkDnsMap.remove(network)
             onUpdateNetwork()
             handleNetworkChange()
+            invokeDart("networkChanged")
         }
 
         override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
@@ -354,6 +396,7 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED)
     }.build()
 
+    @Suppress("DEPRECATION", "UnspecifiedRegisterReceiverFlag")
     private fun registerNetworkCallback() {
         if (!networkCallbackRegistered.compareAndSet(false, true)) return
         runCatching {
@@ -362,6 +405,26 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         }.onFailure {
             networkCallbackRegistered.set(false)
             android.util.Log.e("VpnPlugin", "Failed to register network callback: ${it.message}")
+        }
+
+        // Register screen state receiver for Doze workaround
+        if (screenReceiverRegistered.compareAndSet(false, true)) {
+            runCatching {
+                val filter = IntentFilter().apply {
+                    addAction(Intent.ACTION_SCREEN_ON)
+                    addAction(Intent.ACTION_USER_PRESENT)
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    BettboxApplication.getAppContext().registerReceiver(
+                        screenReceiver, filter, Context.RECEIVER_NOT_EXPORTED
+                    )
+                } else {
+                    BettboxApplication.getAppContext().registerReceiver(screenReceiver, filter)
+                }
+            }.onFailure {
+                screenReceiverRegistered.set(false)
+                android.util.Log.e("VpnPlugin", "Failed to register screen receiver: ${it.message}")
+            }
         }
     }
 
@@ -376,8 +439,17 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             networkDnsMap.clear()
             onUpdateNetwork()
         }
+
+        // Unregister screen state receiver
+        if (screenReceiverRegistered.compareAndSet(true, false)) {
+            runCatching {
+                BettboxApplication.getAppContext().unregisterReceiver(screenReceiver)
+            }.onFailure {
+                android.util.Log.e("VpnPlugin", "Failed to unregister screen receiver: ${it.message}")
+            }
+        }
     }
-    
+
     private fun handleNetworkChange() {
         val currentNetworkType = getCurrentNetworkType()
         if (lastNetworkType == null) {
@@ -417,7 +489,7 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             }
         }
     }
-    
+
     private fun getCurrentNetworkType(): Int {
         val activeNetwork = connectivity?.activeNetwork ?: return -1
         val caps = connectivity?.getNetworkCapabilities(activeNetwork) ?: return -1
@@ -508,7 +580,7 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             bindService()
             return
         }
-        
+
         scope.launch {
             try {
                 val prepareIntent = try {
@@ -623,9 +695,9 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             val success = runCatching {
                 (bettBoxService as? BettboxVpnService)?.protect(fd) == true
             }.getOrDefault(false)
-            
+
             if (success) return true
-            
+
             retries++
             if (retries < 5) {
                 Thread.sleep(60)
