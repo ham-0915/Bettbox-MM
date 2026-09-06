@@ -169,6 +169,12 @@ Future<void> _service(List<String> flags) async {
         final networks = vpnProps.smartAutoStopNetworks;
         if (networks.isEmpty) return;
 
+        // Sync config to Kotlin for native-side direct resume
+        vpn?.syncSmartStopConfig(
+          enabled: true,
+          networks: networks,
+        );
+
         await smartAutoStopLock.synchronized(() async {
           if (_isInCooldown()) return;
           final isSmartStopped = await vpn?.isSmartStopped() ?? false;
@@ -177,10 +183,6 @@ Future<void> _service(List<String> flags) async {
           final candidateGateways =
               await vpn?.getLocalGateways() ?? const <String>[];
           if (candidateIps.isEmpty && candidateGateways.isEmpty) {
-            // When IP info is unavailable (network transitioning, Doze wake,
-            // or networks set temporarily empty during WiFi disconnect):
-            // If currently smart-stopped, attempt resume. The Kotlin-side
-            // periodic check will re-stop if network still matches.
             if (isSmartStopped) {
               await vpn?.setSmartStopped(false);
               await vpn?.smartResume(clashLibHandler.getAndroidVpnOptions());
