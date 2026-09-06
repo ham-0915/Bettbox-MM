@@ -47,6 +47,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.ConcurrentHashMap
@@ -54,6 +55,24 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.withLock
 
 data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
+
+    // --- Smart auto stop config (synced from Dart for native-side matching) ---
+    private data class SmartAutoStopConfig(
+        val enabled: Boolean,
+        val networks: List<String>
+    )
+
+    @Volatile
+    private var cachedSmartAutoStopConfig: SmartAutoStopConfig? = null
+
+    // --- Direct resume job (Kotlin-side, bypasses Dart entirely) ---
+    private var directResumeJob: Job? = null
+
+    // --- Cooldown for direct resume ---
+    @Volatile
+    private var lastDirectResumeTime: Long = 0
+    private const val DIRECT_RESUME_COOLDOWN_MS = 5000L
+
     @Volatile
     private var bettBoxService: BaseServiceInterface? = null
     @Volatile
@@ -76,8 +95,6 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     private var lastDns = ""
 
     // --- Screen state broadcast receiver ---
-    // When screen turns on, send networkChanged at multiple timepoints.
-    // Covers different Flutter engine wake-up scenarios.
     private val screenHandler = Handler(Looper.getMainLooper())
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -99,12 +116,9 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     }
     private val screenReceiverRegistered = AtomicBoolean(false)
 
-    // --- Smart-stopped periodic check (Kotlin-side) ---
-    // While VPN is in smart-stopped state, send invokeDart("networkChanged")
-    // every 5 seconds. This runs in Kotlin's Handler (foreground service process),
-    // NOT in Flutter's Timer, so it works even when Flutter engine is paused by Doze.
-    // Once Dart wakes up and processes the signal, it will check network state
-    // and resume VPN if WiFi is gone.
+    // --- Smart-stopped periodic check ---
+    // Every 5s, performs native-side network matching and direct resume.
+    // Runs in Kotlin foreground service process, NOT in Flutter.
     private var smartStoppedCheckHandler: Handler? = null
     private var smartStoppedCheckRunnable: Runnable? = null
 
@@ -114,7 +128,7 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         smartStoppedCheckRunnable = object : Runnable {
             override fun run() {
                 if (!GlobalState.isSmartStopped) return
-                invokeDart("networkChanged")
+                performNativeSmartAutoStopCheck()
                 smartStoppedCheckHandler?.postDelayed(this, 5000)
             }
         }
@@ -127,6 +141,130 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         }
         smartStoppedCheckRunnable = null
         smartStoppedCheckHandler = null
+    }
+
+    // --- Native-side network matching (CIDR + exact IP) ---
+    private fun matchesAnyNetwork(address: String, patterns: List<String>): Boolean {
+        return patterns.any { pattern -> matchesPattern(address, pattern) }
+    }
+
+    private fun matchesPattern(address: String, pattern: String): Boolean {
+        return try {
+            if (pattern.contains("/")) {
+                matchCidr(address, pattern)
+            } else {
+                address == pattern.trim()
+            }
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private fun matchCidr(address: String, cidr: String): Boolean {
+        val parts = cidr.split("/")
+        if (parts.size != 2) return false
+        val prefixLen = parts[1].trim().toIntOrNull() ?: return false
+        val networkBytes = try {
+            InetAddress.getByName(parts[0].trim()).address
+        } catch (e: Exception) {
+            return false
+        }
+        val addressBytes = try {
+            InetAddress.getByName(address).address
+        } catch (e: Exception) {
+            return false
+        }
+        if (networkBytes.size != addressBytes.size) return false
+
+        val fullBytes = prefixLen / 8
+        val remainderBits = prefixLen % 8
+
+        for (i in 0 until fullBytes) {
+            if (addressBytes[i] != networkBytes[i]) return false
+        }
+
+        if (remainderBits > 0 && fullBytes < addressBytes.size) {
+            val mask = (0xFF shl (8 - remainderBits)) and 0xFF
+            if ((addressBytes[fullBytes].toInt() and mask) != (networkBytes[fullBytes].toInt() and mask)) {
+                return false
+            }
+        }
+
+        return true
+    }
+
+    // --- Scheduled direct resume (from onLost, 3s delay) ---
+    private fun scheduleDirectResume() {
+        directResumeJob?.cancel()
+        directResumeJob = scope.launch {
+            delay(3000)
+            if (!GlobalState.isSmartStopped) return@launch
+            if (GlobalState.currentRunState == RunState.START) return@launch
+
+            val now = System.currentTimeMillis()
+            if (now - lastDirectResumeTime < DIRECT_RESUME_COOLDOWN_MS) return@launch
+
+            val config = cachedSmartAutoStopConfig
+            if (config != null && config.enabled && config.networks.isNotEmpty()) {
+                val candidateIps = getLocalIpAddresses()
+                val candidateGateways = getLocalGateways()
+
+                if (candidateIps.isNotEmpty() || candidateGateways.isNotEmpty()) {
+                    val shouldStop = candidateIps.any { ip ->
+                        matchesAnyNetwork(ip, config.networks)
+                    } || candidateGateways.any { gw ->
+                        matchesAnyNetwork(gw, config.networks)
+                    }
+                    if (shouldStop) {
+                        android.util.Log.d("VpnPlugin", "Direct resume: network still matches, skip")
+                        return@launch
+                    }
+                }
+            }
+
+            val currentOptions = this@VpnPlugin.options
+            if (currentOptions != null) {
+                lastDirectResumeTime = now
+                android.util.Log.d("VpnPlugin", "Direct resume: Kotlin-side smart resume")
+                handleSmartResume(currentOptions)
+            }
+        }
+    }
+
+    private fun cancelDirectResume() {
+        directResumeJob?.cancel()
+        directResumeJob = null
+    }
+
+    // --- Native periodic check (every 5s while smart-stopped) ---
+    private fun performNativeSmartAutoStopCheck() {
+        if (!GlobalState.isSmartStopped) return
+        if (GlobalState.currentRunState == RunState.START) return
+
+        val now = System.currentTimeMillis()
+        if (now - lastDirectResumeTime < DIRECT_RESUME_COOLDOWN_MS) return
+
+        val config = cachedSmartAutoStopConfig
+        if (config != null && config.enabled && config.networks.isNotEmpty()) {
+            val candidateIps = getLocalIpAddresses()
+            val candidateGateways = getLocalGateways()
+
+            if (candidateIps.isNotEmpty() || candidateGateways.isNotEmpty()) {
+                val shouldStop = candidateIps.any { ip ->
+                    matchesAnyNetwork(ip, config.networks)
+                } || candidateGateways.any { gw ->
+                    matchesAnyNetwork(gw, config.networks)
+                }
+                if (shouldStop) {
+                    return
+                }
+            }
+        }
+
+        val currentOptions = this@VpnPlugin.options ?: return
+        lastDirectResumeTime = now
+        android.util.Log.d("VpnPlugin", "Native periodic check: resuming VPN")
+        handleSmartResume(currentOptions)
     }
 
     val networks: MutableSet<Network> = Collections.newSetFromMap(ConcurrentHashMap())
@@ -289,6 +427,14 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                 result.success(GlobalState.currentRunState == RunState.START)
             }
 
+            "syncSmartStopConfig" -> {
+                val enabled = call.argument<Boolean>("enabled") ?: false
+                val networkList = call.argument<List<String>>("networks") ?: emptyList()
+                cachedSmartAutoStopConfig = SmartAutoStopConfig(enabled, networkList)
+                android.util.Log.d("VpnPlugin", "Synced smart stop config: enabled=$enabled, networks=$networkList")
+                result.success(true)
+            }
+
             else -> {
                 result.notImplemented()
             }
@@ -418,6 +564,14 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             onUpdateNetwork()
             handleNetworkChange()
             invokeDart("networkChanged")
+
+            // KEY FIX: When a network is lost while smart-stopped,
+            // schedule a direct resume from Kotlin side.
+            // Runs in foreground service process, NOT in Flutter.
+            // Works even when Flutter engine is killed by Doze/MIUI.
+            if (GlobalState.isSmartStopped) {
+                scheduleDirectResume()
+            }
         }
 
         override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
@@ -444,7 +598,6 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             android.util.Log.e("VpnPlugin", "Failed to register network callback: ${it.message}")
         }
 
-        // Register screen state receiver for Doze workaround
         if (screenReceiverRegistered.compareAndSet(false, true)) {
             runCatching {
                 val filter = IntentFilter().apply {
@@ -477,7 +630,6 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             onUpdateNetwork()
         }
 
-        // Unregister screen state receiver
         if (screenReceiverRegistered.compareAndSet(true, false)) {
             runCatching {
                 BettboxApplication.getAppContext().unregisterReceiver(screenReceiver)
@@ -768,8 +920,9 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     }
 
     fun handleStop(force: Boolean = false) {
-        // Stop smart-stopped periodic check
         stopSmartStoppedPeriodicCheck()
+        cancelDirectResume()
+        cachedSmartAutoStopConfig = null
 
         val serviceRef: BaseServiceInterface?
         val wasBound: Boolean
@@ -841,14 +994,12 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             Toast.makeText(BettboxApplication.getAppContext(), "Bettbox Suspended", Toast.LENGTH_SHORT).show()
         }
         ServicePlugin.notifyNetworkChanged()
-
-        // Start Kotlin-side periodic check while smart-stopped
         startSmartStoppedPeriodicCheck()
     }
 
     fun handleSmartResume(options: VpnOptions): Boolean {
-        // Stop Kotlin-side periodic check
         stopSmartStoppedPeriodicCheck()
+        cancelDirectResume()
 
         scope.launch {
             val startAllowed = GlobalState.runLock.withLock {
@@ -870,7 +1021,7 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             Core.suspended(false)
             (bettBoxService as? BettboxService)?.resetNotificationBuilder()
             (bettBoxService as? BettboxVpnService)?.resetNotificationBuilder()
-            performStartCore(options, retry = false, notifyOnFailure = false)
+            performStartCore(options, retry = true, notifyOnFailure = false)
             withContext(Dispatchers.Main) {
                 Toast.makeText(BettboxApplication.getAppContext(), "Bettbox Connected", Toast.LENGTH_SHORT).show()
             }
